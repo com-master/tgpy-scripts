@@ -20,8 +20,14 @@
 #     .recap 2d https://t.me/some_chat
 #     .recap 50 id:123456789  — положительный id (личка/бот) через id:
 # Рекап приходит в чат, где введена команда.
+#
+# Комментарий к слову «Рекап» — в конце команды:
+#     .recap 100 коротко        — пресеты: коротко / подробно / тезисы
+#     .recap 2d только про деньги и сроки
+#     .recap подробно           — без числа/даты берутся 100 сообщений
 
 import asyncio
+import html as html_lib
 import json
 import re
 import urllib.request
@@ -39,8 +45,17 @@ RECAP_PROMPT = "Рекап"            # слово/инструкция, с к�
 RECAP_SYSTEM = (
     "Ты делаешь краткий рекап переписки из Telegram-чата на русском языке. "
     "Выдели основные темы, ключевые решения, вопросы и кто что предлагал. "
-    "Пиши структурированно и по делу."
+    "Пиши структурированно и по делу. Оформляй ответ в Markdown: "
+    "заголовки ###, списки через «- », **жирный**, *курсив*."
 )
+# Пресеты комментария: `.recap 100 коротко` → «Рекап: <текст пресета>».
+# Любой другой текст после количества/даты уходит к слову «Рекап» как есть.
+RECAP_STYLES = {
+    ("коротко", "кратко", "short"): "коротко, 3–5 главных пунктов, без деталей",
+    ("подробно", "детально", "full"): "подробно: все темы, решения, кто что сказал",
+    ("тезисы", "пункты"): "только список тезисов, без вступления и выводов",
+}
+RECAP_SPLIT = 3800                # макс. длина одной части ответа (лимит TG 4096)
 RECAP_MAX_MESSAGES = 3000         # потолок сообщений за один рекап
 RECAP_MAX_CHARS = 120_000         # потолок символов, отправляемых в нейросеть
 RECAP_TIMEOUT = 180               # секунд на ответ API
@@ -85,30 +100,44 @@ def _extract_chat(parts: list[str]):
     return chat, rest
 
 
+def _looks_like_date(s: str) -> bool:
+    return bool(re.fullmatch(r"[\d.\-]+", s)) and not s.isdigit()
+
+
 def _parse_args(parts: list[str]):
-    """Возвращает (limit, since, until). Ровно одно из limit/since задано."""
-    if not parts:
-        raise ValueError("укажи количество сообщений или дату")
+    """Возвращает (limit, since, until, comment). Ровно одно из limit/since задано.
+    Всё, что после количества/даты, — комментарий к слову «Рекап»."""
+    first = parts[0] if parts else ""
+    rest = parts[1:]
+    limit = since = until = None
+    m = re.fullmatch(r"(\d+)\s*([hdчд])", first.lower())
 
-    if len(parts) == 1 and parts[0].isdigit():
-        return min(int(parts[0]), RECAP_MAX_MESSAGES), None, None
-
-    m = re.fullmatch(r"(\d+)\s*([hdчд])", parts[0].lower())
-    if len(parts) == 1 and m:
+    if first.isdigit():
+        limit = min(int(first), RECAP_MAX_MESSAGES)
+    elif m:
         n, unit = int(m[1]), m[2]
         delta = timedelta(hours=n) if unit in "hч" else timedelta(days=n)
-        return None, datetime.now(_LOCAL_TZ) - delta, None
+        since = datetime.now(_LOCAL_TZ) - delta
+    elif (since := _parse_date(first)) is not None:
+        if rest and (until := _parse_date(rest[0])) is not None:
+            until += timedelta(days=1)  # включительно
+            rest = rest[1:]
+        elif rest and _looks_like_date(rest[0]):
+            raise ValueError(f"не понял дату: {rest[0]}")
+    elif _looks_like_date(first):
+        raise ValueError(f"не понял дату: {first}")
+    else:
+        limit, rest = 100, parts  # `.recap подробно` — 100 сообщений
 
-    since = _parse_date(parts[0])
-    if since is None:
-        raise ValueError(f"не понял дату: {parts[0]}")
-    until = None
-    if len(parts) > 1:
-        until = _parse_date(parts[1])
-        if until is None:
-            raise ValueError(f"не понял дату: {parts[1]}")
-        until += timedelta(days=1)  # включительно
-    return None, since, until
+    return limit, since, until, " ".join(rest)
+
+
+def _style(comment: str) -> str:
+    low = comment.strip().lower()
+    for keys, text in RECAP_STYLES.items():
+        if low in keys:
+            return text
+    return comment.strip()
 
 
 def _sender_name(msg) -> str:
@@ -139,12 +168,13 @@ def _format(msgs) -> str:
     return out
 
 
-def _ask_llm_sync(chat_text: str) -> str:
+def _ask_llm_sync(chat_text: str, comment: str = "") -> str:
+    prompt = f"{RECAP_PROMPT}: {comment}" if comment else RECAP_PROMPT
     body = json.dumps({
         "model": RECAP_MODEL,
         "messages": [
             {"role": "system", "content": RECAP_SYSTEM},
-            {"role": "user", "content": f"{RECAP_PROMPT}\n\n{chat_text}"},
+            {"role": "user", "content": f"{prompt}\n\n{chat_text}"},
         ],
     }).encode()
     req = urllib.request.Request(
@@ -158,6 +188,77 @@ def _ask_llm_sync(chat_text: str) -> str:
     with urllib.request.urlopen(req, timeout=RECAP_TIMEOUT) as resp:
         data = json.load(resp)
     return data["choices"][0]["message"]["content"].strip()
+
+
+def _split(text: str, size: int) -> list[str]:
+    """Режем по строкам, чтобы не разрывать разметку посреди строки."""
+    chunks, cur = [], ""
+    for line in text.split("\n"):
+        while len(line) > size:  # очень длинная строка
+            if cur:
+                chunks.append(cur)
+                cur = ""
+            chunks.append(line[:size])
+            line = line[size:]
+        if cur and len(cur) + len(line) + 1 > size:
+            chunks.append(cur)
+            cur = line
+        else:
+            cur = f"{cur}\n{line}" if cur else line
+    if cur:
+        chunks.append(cur)
+    return [c for c in chunks if c.strip()]
+
+
+def _md_inline(s: str) -> str:
+    s = html_lib.escape(s, quote=False)
+    codes = []
+
+    def keep_code(m):
+        codes.append(m[1])
+        return f"\x00{len(codes) - 1}\x00"
+
+    s = re.sub(r"`([^`\n]+)`", keep_code, s)
+    s = re.sub(r"\[([^\]]+)\]\((https?://[^)\s]+)\)", r'<a href="\2">\1</a>', s)
+    s = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", s)
+    s = re.sub(r"__(.+?)__", r"<u>\1</u>", s)
+    s = re.sub(r"~~(.+?)~~", r"<s>\1</s>", s)
+    s = re.sub(r"\|\|(.+?)\|\|", r"<tg-spoiler>\1</tg-spoiler>", s)
+    s = re.sub(r"(?<![\w*])\*(?!\s)([^*\n]+?)(?<!\s)\*(?![\w*])", r"<i>\1</i>", s)
+    s = re.sub(r"(?<!\w)_(?!\s)([^_\n]+?)(?<!\s)_(?!\w)", r"<i>\1</i>", s)
+    return re.sub(r"\x00(\d+)\x00", lambda m: f"<code>{codes[int(m[1])]}</code>", s)
+
+
+def _md_to_html(text: str) -> str:
+    """Markdown от нейросети → HTML, который понимает Telegram."""
+    out, in_code, code_buf = [], False, []
+    for line in text.split("\n"):
+        if line.strip().startswith("```"):
+            if in_code:
+                out.append("<pre>" + html_lib.escape("\n".join(code_buf), quote=False) + "</pre>")
+                code_buf = []
+            in_code = not in_code
+            continue
+        if in_code:
+            code_buf.append(line)
+            continue
+
+        if m := re.match(r"\s*#{1,6}\s+(.*)", line):  # заголовок
+            title = re.sub(r"^\*\*(.*)\*\*$", r"\1", m[1].strip())
+            out.append(f"<b>{_md_inline(title)}</b>")
+        elif re.fullmatch(r"\s*([-*_])\s*(\1\s*){2,}", line):  # --- разделитель
+            out.append("──────────")
+        elif m := re.match(r"(\s*)[*\-+]\s+(.*)", line):  # список
+            level = min((len(m[1].expandtabs(4)) + 2) // 4, 3)
+            bullet = "•" if level == 0 else "◦"
+            out.append("    " * level + f"{bullet} {_md_inline(m[2])}")
+        elif m := re.match(r"\s*>\s?(.*)", line):  # цитата
+            out.append(f"<blockquote>{_md_inline(m[1])}</blockquote>")
+        else:
+            out.append(_md_inline(line))
+    if in_code and code_buf:
+        out.append("<pre>" + html_lib.escape("\n".join(code_buf), quote=False) + "</pre>")
+    return "\n".join(out)
 
 
 async def _set_status(msg, text: str):
@@ -181,7 +282,7 @@ async def recap(args: str = "100"):
 async def _recap(msg, args):
     chat_ref, parts = _extract_chat(str(args).split())
     try:
-        limit, since, until = _parse_args(parts or ["100"])
+        limit, since, until, comment = _parse_args(parts)
     except ValueError as e:
         return f"❌ {e}"
 
@@ -213,13 +314,16 @@ async def _recap(msg, args):
         return "❌ Нет сообщений для рекапа"
 
     try:
-        answer = await asyncio.to_thread(_ask_llm_sync, chat_text)
+        answer = await asyncio.to_thread(_ask_llm_sync, chat_text, _style(comment))
     except Exception as e:
         return f"❌ Ошибка API: {e!r}"
 
-    text = f"📝 Рекап ({len(msgs)} сообщ.):\n\n{answer}"
-    for i in range(0, len(text), 4096):
-        await client.send_message(msg.chat_id, text[i:i + 4096])
+    text = f"📝 **Рекап** ({len(msgs)} сообщ.)\n\n{answer}"
+    for chunk in _split(text, RECAP_SPLIT):
+        try:
+            await client.send_message(msg.chat_id, _md_to_html(chunk), parse_mode="html")
+        except Exception:  # на случай кривой разметки — шлём как есть
+            await client.send_message(msg.chat_id, chunk, parse_mode=None)
     return f"✅ Рекап отправлен ({len(msgs)} сообщ.)"
 
 
