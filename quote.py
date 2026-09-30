@@ -1,13 +1,16 @@
 """
     name: quote
-    description: Стикер-цитата из сообщений, как у @QuotLyBot
-    usage (ответом на сообщение):
-        .q                — стикер из одного сообщения
-        .q 3              — из этого и 2 следующих сообщений
-        .q #232323        — свой цвет фона (hex или название, напр. black)
-        .q 3 black        — можно комбинировать
-        .q bot            — сделать через самого @QuotLyBot (если API недоступен)
+    origin: https://github.com/com-master/tgpy-scripts/quote.py
+    priority: 1001
+    description: Стикеры-цитаты из сообщений, как у QuotLyBot
 """
+
+# usage (ответом на сообщение):
+#     .q                — стикер из одного сообщения
+#     .q 3              — из этого и 2 следующих сообщений
+#     .q #232323        — свой цвет фона (hex или название, напр. black)
+#     .q 3 black        — можно комбинировать
+#     .q bot            — сделать через самого @QuotLyBot (если API недоступен)
 
 import asyncio
 import base64
