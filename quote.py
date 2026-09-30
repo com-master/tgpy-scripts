@@ -114,19 +114,24 @@ async def _via_bot(msgs, chat_id, reply_to):
     await client.send_file(chat_id, resp.media, reply_to=reply_to)
 
 
-async def _delete_later(msg, delay=1.5):
-    await asyncio.sleep(delay)
-    try:
-        await msg.delete()
-    except Exception:
-        pass
-
-
 async def quote(args: str = ""):
     msg = ctx.msg
+    ctx.is_manual_output = True  # сообщение с командой обрабатываем сами
+    error = await _quote(msg, args)
+    try:
+        if error:
+            await msg.edit(error)
+        elif QUOTE_DELETE_CMD:
+            await msg.delete()
+    except Exception:  # MessageNotModified / уже удалено и т.п.
+        pass
+    return error
+
+
+async def _quote(msg, args):
     reply = await msg.get_reply_message()
     if reply is None:
-        return "Ответь командой на сообщение"
+        return "❌ Ответь командой на сообщение"
 
     count, color, use_bot = 1, QUOTE_BG_COLOR, False
     for a in str(args).split():
@@ -179,11 +184,8 @@ async def quote(args: str = ""):
                 ],
             )
     except Exception as e:
-        return f"Ошибка: {e!r}"
-
-    if QUOTE_DELETE_CMD:
-        asyncio.create_task(_delete_later(msg))
-    return "✅"
+        return f"❌ Ошибка: {e!r}"
+    return None
 
 
 def _quote_transformer(code: str) -> str:

@@ -157,10 +157,30 @@ def _ask_llm_sync(chat_text: str) -> str:
     return data["choices"][0]["message"]["content"].strip()
 
 
+async def _set_status(msg, text: str):
+    """Сами пишем статус в сообщение с командой, TGPy его не трогает."""
+    try:
+        await msg.edit(text)
+    except Exception:  # MessageNotModified / сообщение удалено и т.п.
+        pass
+
+
 async def recap(args: str = "100"):
     msg = ctx.msg
+    if msg is not None:
+        ctx.is_manual_output = True  # иначе TGPy сам редактирует сообщение
+    status = await _recap(msg, args)
+    if msg is not None:
+        await _set_status(msg, status)
+    return status
+
+
+async def _recap(msg, args):
     chat_ref, parts = _extract_chat(str(args).split())
-    limit, since, until = _parse_args(parts or ["100"])
+    try:
+        limit, since, until = _parse_args(parts or ["100"])
+    except ValueError as e:
+        return f"❌ {e}"
 
     if chat_ref is None:
         chat, max_id = msg.chat_id, msg.id  # не берём саму команду
@@ -168,7 +188,7 @@ async def recap(args: str = "100"):
         try:
             chat = await client.get_entity(chat_ref)
         except Exception as e:
-            return f"Не нашёл чат {chat_ref}: {e!r}"
+            return f"❌ Не нашёл чат {chat_ref}: {e!r}"
         max_id = 0
 
     if limit is not None:
@@ -187,12 +207,12 @@ async def recap(args: str = "100"):
 
     chat_text = _format(msgs)
     if not chat_text:
-        return "Нет сообщений для рекапа"
+        return "❌ Нет сообщений для рекапа"
 
     try:
         answer = await asyncio.to_thread(_ask_llm_sync, chat_text)
     except Exception as e:
-        return f"Ошибка API: {e!r}"
+        return f"❌ Ошибка API: {e!r}"
 
     text = f"📝 Рекап ({len(msgs)} сообщ.):\n\n{answer}"
     for i in range(0, len(text), 4096):
