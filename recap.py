@@ -9,6 +9,13 @@
         .recap 29.09 30.09  — диапазон дат (включительно)
         .recap сегодня / вчера
         .recap 3h / 2d      — за последние 3 часа / 2 дня
+
+    Другой чат — добавь его id / @username / ссылку (в любом месте):
+        .recap 100 -1001234567890
+        .recap 29.09 @durov
+        .recap 2d https://t.me/some_chat
+        .recap 50 id:123456789  — положительный id (личка/бот) через id:
+    Рекап приходит в чат, где введена команда.
 """
 
 import asyncio
@@ -58,9 +65,25 @@ def _parse_date(s: str) -> datetime | None:
         return None
 
 
-def _parse_args(args: str):
+def _extract_chat(parts: list[str]):
+    """Вынимает из аргументов ссылку на чат. Возвращает (chat | None, остальное)."""
+    chat, rest = None, []
+    for p in parts:
+        low = p.lower()
+        if chat is None and re.fullmatch(r"-\d+", p):
+            chat = int(p)
+        elif chat is None and low.startswith(("id:", "chat:")):
+            v = p.split(":", 1)[1]
+            chat = int(v) if re.fullmatch(r"-?\d+", v) else v
+        elif chat is None and (p.startswith("@") or "t.me/" in low):
+            chat = p
+        else:
+            rest.append(p)
+    return chat, rest
+
+
+def _parse_args(parts: list[str]):
     """Возвращает (limit, since, until). Ровно одно из limit/since задано."""
-    parts = args.split()
     if not parts:
         raise ValueError("укажи количество сообщений или дату")
 
@@ -136,19 +159,27 @@ def _ask_llm_sync(chat_text: str) -> str:
 
 async def recap(args: str = "100"):
     msg = ctx.msg
-    limit, since, until = _parse_args(str(args))
+    chat_ref, parts = _extract_chat(str(args).split())
+    limit, since, until = _parse_args(parts or ["100"])
+
+    if chat_ref is None:
+        chat, max_id = msg.chat_id, msg.id  # не берём саму команду
+    else:
+        try:
+            chat = await client.get_entity(chat_ref)
+        except Exception as e:
+            return f"Не нашёл чат {chat_ref}: {e!r}"
+        max_id = 0
 
     if limit is not None:
         msgs = [
-            m async for m in client.iter_messages(msg.chat_id, limit=limit, max_id=msg.id)
+            m async for m in client.iter_messages(chat, limit=limit, max_id=max_id)
         ]
         msgs.reverse()
     else:
         msgs = []
-        async for m in client.iter_messages(
-            msg.chat_id, offset_date=since, reverse=True
-        ):
-            if m.id >= msg.id or (until and m.date >= until):
+        async for m in client.iter_messages(chat, offset_date=since, reverse=True):
+            if (max_id and m.id >= max_id) or (until and m.date >= until):
                 break
             msgs.append(m)
             if len(msgs) >= RECAP_MAX_MESSAGES:
