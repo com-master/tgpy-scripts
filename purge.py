@@ -12,6 +12,11 @@
 #     .purge -1001234567890 mine      — предпросмотр: только мои сообщения
 #     .purge -1001234567890 mine confirm — удалить только свои (права не нужны)
 #
+# В режиме mine удаляются и сообщения, отправленные от имени твоих каналов
+# (Premium «Отправлять как…»). Каналы берутся из списка «Отправлять как» этой
+# группы; если какого-то там уже нет — добавь вручную: as:@channel / as:-100…
+#     .purge -1001234567890 mine as:@mychannel confirm
+#
 # Чат можно указать как -100…, @username, ссылку t.me/… или id:123.
 # Без `confirm` ничего не удаляется. Удаление необратимо.
 # Команду лучше вводить в другом чате (например, в «Избранном»).
@@ -22,6 +27,7 @@ import time
 
 import tgpy.api
 from telethon import errors, types, utils
+from telethon.tl.functions.channels import GetSendAsRequest
 
 try:  # Telethon >= 1.44
     from telethon.tl.functions.messages import (
@@ -65,27 +71,61 @@ async def _call(coro_fn, *args, **kwargs):
             await asyncio.sleep(e.seconds + 1)
 
 
+def _ref(v: str):
+    return int(v) if re.fullmatch(r"-?\d+", v) else v
+
+
 def _parse(args: str):
-    chat_ref, mine, confirm = None, False, False
+    chat_ref, mine, confirm, extra = None, False, False, []
     for p in str(args).split():
         low = p.lower()
-        if low in _CONFIRM:
+        if low.startswith("as:"):
+            extra.append(_ref(p[3:]))
+            mine = True
+        elif low in _CONFIRM:
             confirm = True
         elif low in _MINE:
             mine = True
         elif chat_ref is None:
-            if re.fullmatch(r"-?\d+", p):
-                chat_ref = int(p)
-            elif low.startswith(("id:", "chat:")):
-                v = p.split(":", 1)[1]
-                chat_ref = int(v) if re.fullmatch(r"-?\d+", v) else v
-            else:
-                chat_ref = p
+            chat_ref = _ref(p.split(":", 1)[1] if low.startswith(("id:", "chat:")) else p)
         else:
             raise ValueError(f"лишний аргумент: {p}")
     if chat_ref is None:
         raise ValueError("укажи id чата: .purge -1001234567890")
-    return chat_ref, mine, confirm
+    return chat_ref, mine, confirm, extra
+
+
+async def _my_senders(chat, extra) -> list:
+    """Я + мои каналы, от имени которых можно писать в этот чат (Premium)."""
+    senders = [await client.get_me()]
+    try:
+        res = await _call(client, GetSendAsRequest(peer=chat))
+        ents = {utils.get_peer_id(e): e for e in [*res.chats, *res.users]}
+        for sp in res.peers:
+            e = ents.get(utils.get_peer_id(sp.peer))
+            if e is not None:
+                senders.append(e)
+    except errors.RPCError:
+        pass  # обычная группа / «отправлять как» недоступно
+    for ref in extra:
+        senders.append(await client.get_entity(ref))
+    uniq = {}
+    for e in senders:
+        uniq.setdefault(utils.get_peer_id(e), e)
+    return list(uniq.values())
+
+
+def _name(e) -> str:
+    return getattr(e, "title", None) or getattr(e, "first_name", None) or str(e.id)
+
+
+async def _count(chat, senders) -> int:
+    if senders is None:
+        return (await client.get_messages(chat, limit=0)).total
+    total = 0
+    for s in senders:
+        total += (await client.get_messages(chat, limit=0, from_user=s)).total
+    return total
 
 
 async def _get_topics(chat) -> list:
@@ -143,19 +183,21 @@ async def _delete_ids(chat, ids) -> int:
         return done
 
 
-async def _sweep(chat, progress, skip_id, done_topics, from_me) -> int:
-    deleted, batch = 0, []
-    kw = {"from_user": "me"} if from_me else {}
-    async for m in client.iter_messages(chat, **kw):
-        if m.id == skip_id:
-            continue
-        batch.append(m.id)
-        if len(batch) >= PURGE_BATCH:
+async def _sweep(chat, progress, skip_id, done_topics, senders) -> int:
+    deleted = 0
+    for sender in senders or [None]:  # None — все сообщения
+        batch = []
+        kw = {"from_user": sender} if sender is not None else {}
+        async for m in client.iter_messages(chat, **kw):
+            if m.id == skip_id:
+                continue
+            batch.append(m.id)
+            if len(batch) >= PURGE_BATCH:
+                deleted += await _delete_ids(chat, batch)
+                batch = []
+                await progress(f"Топиков удалено: {done_topics}\nСообщений удалено: {deleted}")
+        if batch:
             deleted += await _delete_ids(chat, batch)
-            batch = []
-            await progress(f"Топиков удалено: {done_topics}\nСообщений удалено: {deleted}")
-    if batch:
-        deleted += await _delete_ids(chat, batch)
     return deleted
 
 
@@ -176,7 +218,7 @@ async def purge(args: str = ""):
 
 
 async def _purge(msg, args):
-    chat_ref, mine, confirm = _parse(args)
+    chat_ref, mine, confirm, extra = _parse(args)
     try:
         chat = await client.get_entity(chat_ref)
     except Exception as e:
@@ -196,7 +238,8 @@ async def _purge(msg, args):
         )
 
     skip_id = msg.id if msg.chat_id == utils.get_peer_id(chat) else None  # саму команду
-    total = (await client.get_messages(chat, limit=0, **({"from_user": "me"} if mine else {}))).total
+    senders = await _my_senders(chat, extra) if mine else None
+    total = await _count(chat, senders)
     topics = await _get_topics(chat) if is_forum else []
 
     if not confirm:
@@ -205,10 +248,13 @@ async def _purge(msg, args):
             f"Режим: {'только мои сообщения' if mine else 'ВСЕ сообщения'}",
             f"Сообщений: ~{total}",
         ]
+        if senders:
+            lines.insert(2, "От имени: " + ", ".join(_name(e) for e in senders))
         if is_forum:
             lines.append(f"Топиков: {len(topics)}"
                          + ("" if mine else " (будут удалены целиком, кроме «Общего»)"))
-        cmd = f".purge {chat_ref}{' mine' if mine else ''} confirm"
+        cmd = " ".join([".purge", str(chat_ref)] + (["mine"] if mine else [])
+                       + [f"as:{r}" for r in extra] + ["confirm"])
         lines += ["", "Удаление необратимо. Чтобы удалить, отправь:", cmd]
         return "\n".join(lines)
 
@@ -227,9 +273,9 @@ async def _purge(msg, args):
             done_topics += 1
             await progress(f"Топиков удалено: {done_topics}/{len(topics)}")
 
-    deleted = await _sweep(chat, progress, skip_id, done_topics, from_me=mine)
+    deleted = await _sweep(chat, progress, skip_id, done_topics, senders)
 
-    left = (await client.get_messages(chat, limit=0, **({"from_user": "me"} if mine else {}))).total
+    left = await _count(chat, senders)
     result = [f"✅ «{title}»: удалено сообщений: {deleted}"]
     if done_topics:
         result.append(f"Топиков удалено целиком: {done_topics}")
