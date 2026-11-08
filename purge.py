@@ -2,7 +2,7 @@
     name: purge
     origin: https://github.com/com-master/tgpy-scripts/purge.py
     priority: 1002
-    description: Удаление всех сообщений в группе по id, включая все топики
+    description: Удаление всех сообщений в группе по id (или старше даты), включая все топики
 """
 
 # usage:
@@ -11,6 +11,13 @@
 #                                       на удаление), все топики форума — целиком
 #     .purge -1001234567890 mine      — предпросмотр: только мои сообщения
 #     .purge -1001234567890 mine confirm — удалить только свои (права не нужны)
+#
+# Только сообщения старше даты (до неё, сама дата не входит):
+#     .purge -1001234567890 90d               — предпросмотр: старше 90 дней
+#     .purge -1001234567890 до:29.09.2026     — старше 29.09.2026 00:00
+#     .purge -1001234567890 mine 2w confirm   — удалить свои старше 2 недель
+# Относительно: 12h/ч, 90d/д, 2w/н, 6mo/мес, 1y/г. Даты: 29.09, 29.09.2026,
+# 2026-09-29, 2026-09-29T14:30, сегодня, вчера. Префикс before:/до: не обязателен.
 #
 # В режиме mine удаляются и сообщения, отправленные от имени твоих каналов
 # (Premium «Отправлять как…»). Каналы берутся из списка «Отправлять как» этой
@@ -24,6 +31,7 @@
 import asyncio
 import re
 import time
+from datetime import datetime, timedelta
 
 import tgpy.api
 from telethon import errors, types, utils
@@ -60,6 +68,15 @@ GENERAL_TOPIC_ID = 1           # «Общий» топик нельзя удал
 
 _CONFIRM = {"confirm", "да", "yes"}
 _MINE = {"mine", "my", "мои", "свои"}
+_BEFORE_PREFIXES = ("before:", "older:", "до:", "старше:")
+_LOCAL_TZ = datetime.now().astimezone().tzinfo
+_UNITS = {  # единица → timedelta на 1
+    "h": timedelta(hours=1), "ч": timedelta(hours=1),
+    "d": timedelta(days=1), "д": timedelta(days=1),
+    "w": timedelta(weeks=1), "н": timedelta(weeks=1),
+    "mo": timedelta(days=30), "мес": timedelta(days=30),
+    "y": timedelta(days=365), "г": timedelta(days=365),
+}
 
 
 async def _call(coro_fn, *args, **kwargs):
@@ -75,11 +92,47 @@ def _ref(v: str):
     return int(v) if re.fullmatch(r"-?\d+", v) else v
 
 
+def _parse_cutoff(s: str):
+    """90d / 2w / 29.09.2026 / 2026-09-29T14:30 → datetime (aware) или None."""
+    s = s.strip().lower()
+    now = datetime.now(_LOCAL_TZ).replace(second=0, microsecond=0)
+    today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    m = re.fullmatch(r"(\d+)\s*([a-zа-я]+)", s)
+    if m and m[2] in _UNITS:
+        return now - int(m[1]) * _UNITS[m[2]]
+    if s in ("today", "сегодня"):
+        return today
+    if s in ("yesterday", "вчера"):
+        return today - timedelta(days=1)
+    for fmt in ("%Y-%m-%dT%H:%M", "%d.%m.%Y", "%d.%m.%y", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(s, fmt).replace(tzinfo=_LOCAL_TZ)
+        except ValueError:
+            pass
+    try:
+        return datetime.strptime(s, "%d.%m").replace(year=today.year, tzinfo=_LOCAL_TZ)
+    except ValueError:
+        return None
+
+
+def _fmt(d: datetime) -> str:
+    return d.astimezone(_LOCAL_TZ).strftime("%d.%m.%Y %H:%M")
+
+
 def _parse(args: str):
-    chat_ref, mine, confirm, extra = None, False, False, []
+    chat_ref, mine, confirm, extra, cutoff = None, False, False, [], None
     for p in str(args).split():
         low = p.lower()
-        if low.startswith("as:"):
+        pref = next((x for x in _BEFORE_PREFIXES if low.startswith(x)), None)
+        if pref or (not low.startswith("-") and _parse_cutoff(low) is not None):
+            if cutoff is not None:
+                raise ValueError("дата указана дважды")
+            cutoff = _parse_cutoff(p[len(pref):] if pref else p)
+            if cutoff is None:
+                raise ValueError(f"не понял дату: {p}")
+            if cutoff > datetime.now(_LOCAL_TZ):
+                raise ValueError(f"дата в будущем: {p}")
+        elif low.startswith("as:"):
             extra.append(_ref(p[3:]))
             mine = True
         elif low in _CONFIRM:
@@ -92,7 +145,7 @@ def _parse(args: str):
             raise ValueError(f"лишний аргумент: {p}")
     if chat_ref is None:
         raise ValueError("укажи id чата: .purge -1001234567890")
-    return chat_ref, mine, confirm, extra
+    return chat_ref, mine, confirm, extra, cutoff
 
 
 async def _my_senders(chat, extra) -> list:
@@ -119,12 +172,14 @@ def _name(e) -> str:
     return getattr(e, "title", None) or getattr(e, "first_name", None) or str(e.id)
 
 
-async def _count(chat, senders) -> int:
+async def _count(chat, senders, cutoff=None) -> int:
+    # С датой — через поиск (search=""), он учитывает max_date в счётчике.
+    kw = {"offset_date": cutoff, "search": ""} if cutoff else {}
     if senders is None:
-        return (await client.get_messages(chat, limit=0)).total
+        return (await client.get_messages(chat, limit=0, **kw)).total
     total = 0
     for s in senders:
-        total += (await client.get_messages(chat, limit=0, from_user=s)).total
+        total += (await client.get_messages(chat, limit=0, from_user=s, **kw)).total
     return total
 
 
@@ -183,13 +238,15 @@ async def _delete_ids(chat, ids) -> int:
         return done
 
 
-async def _sweep(chat, progress, skip_id, done_topics, senders) -> int:
+async def _sweep(chat, progress, skip_id, done_topics, senders, cutoff=None) -> int:
     deleted = 0
     for sender in senders or [None]:  # None — все сообщения
         batch = []
         kw = {"from_user": sender} if sender is not None else {}
+        if cutoff:
+            kw["offset_date"] = cutoff  # только старше даты
         async for m in client.iter_messages(chat, **kw):
-            if m.id == skip_id:
+            if m.id == skip_id or (cutoff and m.date >= cutoff):
                 continue
             batch.append(m.id)
             if len(batch) >= PURGE_BATCH:
@@ -218,7 +275,7 @@ async def purge(args: str = ""):
 
 
 async def _purge(msg, args):
-    chat_ref, mine, confirm, extra = _parse(args)
+    chat_ref, mine, confirm, extra, cutoff = _parse(args)
     try:
         chat = await client.get_entity(chat_ref)
     except Exception as e:
@@ -239,22 +296,30 @@ async def _purge(msg, args):
 
     skip_id = msg.id if msg.chat_id == utils.get_peer_id(chat) else None  # саму команду
     senders = await _my_senders(chat, extra) if mine else None
-    total = await _count(chat, senders)
+    total = await _count(chat, senders, cutoff)
     topics = await _get_topics(chat) if is_forum else []
+    whole_topics = is_forum and not mine and cutoff is None
 
     if not confirm:
         lines = [
             f"⚠️ Предпросмотр «{title}» (id {chat.id})",
             f"Режим: {'только мои сообщения' if mine else 'ВСЕ сообщения'}",
-            f"Сообщений: ~{total}",
         ]
         if senders:
-            lines.insert(2, "От имени: " + ", ".join(_name(e) for e in senders))
+            lines.append("От имени: " + ", ".join(_name(e) for e in senders))
+        if cutoff:
+            lines.append(f"Старше: {_fmt(cutoff)} (более новые не трогаются)")
+        lines.append(f"Сообщений: ~{total}")
         if is_forum:
             lines.append(f"Топиков: {len(topics)}"
-                         + ("" if mine else " (будут удалены целиком, кроме «Общего»)"))
+                         + (" (будут удалены целиком, кроме «Общего»)" if whole_topics
+                            else " (сообщения удаляются по одному, топики остаются)"))
+        # Дата в команде — абсолютная, чтобы удалилось ровно то, что в предпросмотре.
         cmd = " ".join([".purge", str(chat_ref)] + (["mine"] if mine else [])
-                       + [f"as:{r}" for r in extra] + ["confirm"])
+                       + [f"as:{r}" for r in extra]
+                       + ([f"before:{cutoff.astimezone(_LOCAL_TZ):%Y-%m-%dT%H:%M}"]
+                          if cutoff else [])
+                       + ["confirm"])
         lines += ["", "Удаление необратимо. Чтобы удалить, отправь:", cmd]
         return "\n".join(lines)
 
@@ -262,7 +327,7 @@ async def _purge(msg, args):
     await progress("начинаю", force=True)
 
     done_topics = 0
-    if is_forum and not mine:
+    if whole_topics:
         for t in topics:
             if t.id == GENERAL_TOPIC_ID:
                 continue
@@ -273,10 +338,12 @@ async def _purge(msg, args):
             done_topics += 1
             await progress(f"Топиков удалено: {done_topics}/{len(topics)}")
 
-    deleted = await _sweep(chat, progress, skip_id, done_topics, senders)
+    deleted = await _sweep(chat, progress, skip_id, done_topics, senders, cutoff)
 
-    left = await _count(chat, senders)
+    left = await _count(chat, senders, cutoff)
     result = [f"✅ «{title}»: удалено сообщений: {deleted}"]
+    if cutoff:
+        result[0] += f" (старше {_fmt(cutoff)})"
     if done_topics:
         result.append(f"Топиков удалено целиком: {done_topics}")
     if left:
